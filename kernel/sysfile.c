@@ -314,33 +314,8 @@ sys_open(void)
       end_op();
       return -1;
     }
-    if(ip->type == T_SYMLINK) {
-      if((omode & O_NOFOLLOW) == 0){
-        char target[MAXPATH];
-        int recursive_depth = 0;
-        while(1){
-          if(recursive_depth >= 10){
-	    iunlockput(ip);
-	    end_op();
-	    return -1;
-	  }
-          if(readi(ip, 0, (uint64)target, ip->size-MAXPATH, MAXPATH) != MAXPATH){
-	    return -1;
-	  }
-          iunlockput(ip);
-	  if((ip = namei(target)) == 0){
-	    end_op();
-	    return -1;
-	  }
-	  ilock(ip);
-	  if(ip->type != T_SYMLINK){
-	    break;
-	  }
-	  recursive_depth++;
-        }
-      }
-    }
   }
+
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
@@ -510,26 +485,104 @@ sys_pipe(void)
   return 0;
 }
 
-uint64
-sys_symlink(void){
-  char target[MAXPATH], path[MAXPATH];
-  struct inode *ip;
+int
+munmap_impl(uint64 addr, int length)
+{
+  struct proc *p = myproc();
 
-  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0){
+  // 在 vma pool 中找到 addr 对应的 vma
+  struct VMA *vma = 0;
+  int i;
+  for (i = 0; i < MAX_VMA_POOL; i++) {
+    vma = p->vma_pool + i;
+    if (vma->used == 1 && addr >= vma->addr && (addr + length) < (vma->addr + vma->length)) {
+      break;
+    }
+  }
+  if (i > MAX_VMA_POOL) {
     return -1;
   }
-
-  begin_op();
-  if((ip = namei(path)) == 0){
-    ip = create(path, T_SYMLINK, 0, 0);
-    iunlock(ip);
+  // 根据 vma 的信息，将数据回写入文件中
+  uint64 begin_addr = addr;
+  uint64 end_addr = addr + length;
+  if (vma->flags == MAP_SHARED && vma->f->writable) {
+    uint64 cur_addr = begin_addr;
+    while (cur_addr < end_addr) {
+      int sz = end_addr - cur_addr >= PGSIZE? PGSIZE: end_addr - cur_addr;
+      begin_op();
+      ilock(vma->f->ip);
+      if (writei(vma->f->ip, 1, cur_addr, cur_addr - vma->addr, sz) != sz) {
+        return -1;
+      }
+      iunlock(vma->f->ip);
+      end_op();
+      uvmunmap(p->pagetable, cur_addr, 1, 1);
+      cur_addr += PGSIZE;
+    }
   }
-
-  ilock(ip);
-  if(writei(ip, 0, (uint64)target, ip->size, MAXPATH) != MAXPATH){
-    return -1;
+  // 完成回写后，更新 vma 中的信息
+  if (addr == vma->addr) {  // 说明 addr 是 mmap 内存的头部
+    vma->addr += length;
+    vma->length -= length;
+  } else if (addr + length == vma->addr + vma->length) { // 说明 addr 是 mmap 的尾部
+    vma->length -= length;
   }
-  iunlockput(ip);
-  end_op();
+  // 如果 mmap 的内存全部被 munmmap，那需要释放 vma 以及对 file 的引用
+  if (vma->length == 0 && vma->used == 1) {
+    filedup(vma->f);
+    vma->used = 0;
+  }
   return 0;
+}
+
+uint64
+sys_mmap(void)
+{
+    uint64 addr;    // 假定传入的 addr 参数永远为 0
+    int length, prot, flags, offset;
+    struct file *f;
+
+    // system call 的参数检验
+    if (argaddr(0, &addr) < 0 || argint(1, &length) < 0 || argint(2, &prot) < 0
+        || argint(3, &flags) < 0 || argfd(4, 0, &f) < 0 || argint(5, &offset) < 0) {
+        return -1;
+    }
+
+    // 检查权限
+    if (!f->writable && (prot & PROT_WRITE) && flags == MAP_SHARED) {
+        return -1;
+    }
+
+    // 从 vma pool 中分配一个 vma，并填充
+    uint64 vma_addr = vma_alloc();
+    if (vma_addr == 0) {
+        return -1;
+    }
+
+    struct VMA* vma = (struct VMA*) vma_addr;
+    struct proc *p = myproc();
+    vma->addr = p->sz;
+    vma->length = PGROUNDUP(length);
+    vma->prot = prot;
+    vma->flags = flags;
+    vma->offset = offset;
+    vma->f = filedup(f);  // 对 f 的引用 +1
+
+    // 调整分配出去，增加 proc 的 sz
+    p->sz += vma->length;
+    return vma->addr;
+}
+
+uint64
+sys_munmap(void)
+{
+    uint64 addr;
+    int length;
+
+    // 校验 system call 的参数
+    if (argaddr(0, &addr) < 0 || argint(1, &length)) {
+        return -1;
+    }
+
+    return (uint64) munmap_impl(addr, length);
 }
