@@ -23,14 +23,10 @@ struct {
   struct run *freelist;
 } kmem;
 
-struct spinlock reflock;
-uint8 referencecount[PHYSTOP/PGSIZE];
-
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
-  initlock(&reflock, "ref");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -40,13 +36,7 @@ freerange(void *pa_start, void *pa_end)
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
-  {
-    acquire(&reflock);
-    referencecount[(uint64)p / PGSIZE] = 0;
-    release(&reflock);
-    
     kfree(p);
-  }
 }
 
 // Free the page of physical memory pointed at by v,
@@ -84,10 +74,6 @@ kalloc(void)
   r = kmem.freelist;
   if(r)
     kmem.freelist = r->next;
-  if(r)
-    referencecount[PGROUNDUP((uint64)r)/PGSIZE] = 1; 
-  // 查到：https://blog.miigon.net/posts/s081-lab6-copy-on-write-fork/
-  // 说 kalloc() 可以不用加锁，但还没搞懂原理
   release(&kmem.lock);
 
   if(r)
