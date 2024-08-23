@@ -105,5 +105,9 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
-  struct usyscall *usyscall; // data page for usyscall
+  int alarminterval;           // sys_sigalarm() alarm interval in ticks
+  int alarmticks;              // sys_sigalarm() alarm interval in ticks
+  void (*alarmhandler)();      // sys_sigalarm() pointer to the alarm handler function
+  struct trapframe alarmtrapframe;// for saving registers
+  int sigreturned;
 };
